@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "amf-rotary-valve"
+version = "0.0.0"
+
+description = "A Python package that provides control of AMF rotary valves"
+readme = "readme.md"
+license = { text = "EUPL-1.2" }
+requires-python = ">=3.11"
+
+dependencies = [
+  "pyserial>=3.5,<4"
+]
+
+[project.urls]
+repository = "https://github.com/slietar/amf-rotary-valve"
+
+[tool.setuptools.packages.find]
+include = ["amf_rotary_valve"]
