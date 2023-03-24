@@ -18,8 +18,8 @@ $ python -m amf_rotary_valve
 ```py
 from amf_rotary_valve import AMFDevice
 
-device = OkolabDevice(address="COM3")
-device = OkolabDevice(address="/dev/tty.usbmodem1101")
+device = AMFDevice(address="COM3")
+device = AMFDevice(address="/dev/tty.usbmodem1101")
 ```
 
 ```py
@@ -34,7 +34,7 @@ async with device:
 ```
 
 ```py
-for info in OkolabDevice.list():
+for info in AMFDevice.list():
   async with (device := info.create())
     print(await device.get_unique_id())
 ```
