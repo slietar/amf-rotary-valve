@@ -1,6 +1,7 @@
 import asyncio
 from asyncio import Future
 import builtins
+import contextlib
 from dataclasses import dataclass
 from typing import Optional, overload
 from serial import Serial
@@ -14,7 +15,7 @@ Datatype = type[bool] | type[int]
 class AMFDeviceConnectionError(Exception):
   pass
 
-class AMFDeviceConnectionLostError(AMFDeviceConnectionError):
+class AMFDeviceConnectionLostError(Exception):
   pass
 
 
@@ -45,7 +46,6 @@ class AMFDevice:
     self._closed_exc = Future[None]()
     self._closing = False
     self._query_futures = list[Future]()
-    self._main_task = asyncio.create_task(self._main_func())
 
   async def _main_func(self):
     read_task = asyncio.create_task(self._read_loop())
@@ -165,7 +165,7 @@ class AMFDevice:
       self._closed_exc.set_exception(e)
       await self.closed()
 
-      # This statement won't is unreachable as self.closed() will raise an AMFDeviceConnectionLostError.
+      # This statement is unreachable as self.closed() will raise an AMFDeviceConnectionLostError.
       raise
 
   def _parse(self, data: bytes, dtype: Optional[Datatype] = None):
@@ -265,11 +265,27 @@ class AMFDevice:
 
     await self._run(f"M{round(delay * 1000)}R")
 
-  async def __aenter__(self):
-    assert not self._closing
+  @contextlib.asynccontextmanager
+  async def open(self):
+    read_task = asyncio.create_task(self._read_loop())
 
-  async def __aexit__(self, exc_type, exc, tb):
-    await self.close()
+    try:
+      yield
+    finally:
+      self._closing = True
+      futures = self._query_futures + ([self._busy_future] if self._busy_future else list())
+
+      if futures:
+        await asyncio.wait(futures)
+
+      read_task.cancel()
+
+      try:
+        await read_task
+      except asyncio.CancelledError:
+        pass
+
+      await self.close()
 
   @staticmethod
   def list(*, all: bool = False):
