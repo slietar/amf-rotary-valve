@@ -22,9 +22,9 @@ class HierarchyNode:
 async def main():
   root = HierarchyNode(["."])
 
-  for device_info in AMFDevice.list(all=True):
+  for device_info in AMFDevice.list():
     try:
-      async with (device := device_info.create()):
+      async with device_info.create() as device:
         valve = await device.get_valve()
 
         root.children.append(HierarchyNode([

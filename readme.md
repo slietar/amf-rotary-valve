@@ -35,6 +35,6 @@ async with device:
 
 ```py
 for info in AMFDevice.list():
-  async with (device := info.create())
+  async with info.create() as device:
     print(await device.get_unique_id())
 ```
