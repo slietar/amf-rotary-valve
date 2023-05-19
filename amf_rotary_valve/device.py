@@ -1,7 +1,6 @@
 import asyncio
 import builtins
-from asyncio import Event, Future
-from collections import deque
+from asyncio import Event, Future, Lock, Task
 from dataclasses import dataclass
 from typing import Any, Optional, overload
 
@@ -41,7 +40,7 @@ class AMFDevice:
     self.address = address
 
     try:
-      self._serial: Optional[Serial] = Serial(
+      self._serial = Serial(
         baudrate=9600,
         port=address
       )
@@ -49,35 +48,31 @@ class AMFDevice:
       raise AMFDeviceConnectionError from e
 
     self._busy = False
-    self._busy_future: Optional[Future[Any]] = None
     self._closing = False
     self._error_event = Event()
-    self._query_futures = deque[Future[Any]]()
+    self._query_future = Future[Any]()
+    self._query_lock = Lock()
+    self._read_task: Optional[Task[None]] = None
+    self._run_future: Optional[Future[Any]] = None
+    self._run_lock = Lock()
 
   async def _read_loop(self):
     try:
       while True:
-        assert self._serial
-        serial = self._serial
-
         # Call _receive() to process the received data
-        self._receive((await asyncio.to_thread(lambda: serial.read_until(b"\n")))[0:-2])
+        self._receive((await asyncio.to_thread(lambda: self._serial.read_until(b"\n")))[0:-2])
     except SerialException as e:
       raise AMFDeviceConnectionError from e
     finally:
       if not self._closing:
         self._error_event.set()
 
-      self._read_task = None
-
       # Raise exceptions in all the current futures
 
-      if self._busy_future:
-        self._busy_future.set_exception(AMFDeviceConnectionError())
-
-      if self._query_futures:
-        for future in self._query_futures:
-          future.set_exception(AMFDeviceConnectionError())
+      if self._query_future and not self._query_future.done():
+        self._query_future.set_exception(AMFDeviceConnectionError())
+      if self._run_future and not self._run_future.done():
+        self._run_future.set_exception(AMFDeviceConnectionError())
 
   @overload
   async def _query(self, command: str, dtype: type[bool]) -> bool:
@@ -92,25 +87,20 @@ class AMFDevice:
     pass
 
   async def _query(self, command: str, dtype: Optional[Datatype] = None):
-    if self._closing:
-      raise AMFDeviceConnectionError
+    async with self._query_lock:
+      if self._closing or self._error_event.is_set():
+        raise AMFDeviceConnectionError
 
-    future = Future[Any]()
-    self._query_futures.append(future)
+      self._query_future = Future[Any]()
 
-    try:
       try:
-        assert (serial := self._serial)
-        await asyncio.to_thread(lambda: serial.write(f"/_{command}\r".encode()))
-      except:
-        # Remove the future if the write failed
-        self._query_futures.remove(future)
-        raise
-
-      return self._parse(await asyncio.wait_for(asyncio.shield(future), timeout=2.0), dtype=dtype)
-    except (SerialException, asyncio.TimeoutError) as e:
-      self._error_event.set()
-      raise AMFDeviceConnectionError from e
+        await asyncio.to_thread(lambda: self._serial.write(f"/_{command}\r".encode()))
+        return self._parse(await asyncio.wait_for(asyncio.shield(self._query_future), timeout=2.0), dtype=dtype)
+      except (SerialException, asyncio.TimeoutError) as e:
+        self._error_event.set()
+        raise AMFDeviceConnectionError from e
+      finally:
+        self._query_future = None
 
   def _parse(self, data: bytes, dtype: Optional[Datatype] = None):
     response = data[3:-1].decode()
@@ -127,26 +117,22 @@ class AMFDevice:
     was_busy = self._busy
     self._busy = (data[2] & (1 << 5)) < 1
 
-    if self._busy_future and was_busy and (not self._busy):
-      self._busy_future.set_result(data)
-      self._busy_future = None
+    if self._run_future and was_busy and (not self._busy):
+      self._run_future.set_result(data)
+    elif self._query_future:
+      self._query_future.set_result(data)
     else:
-      query_future = self._query_futures.popleft()
-      query_future.set_result(data)
+      raise Exception("Dropping data")
 
   async def _run(self, command: str):
-    if self._closing or (not self._read_task):
-      raise AMFDeviceConnectionError
+    async with self._run_lock:
+      self._run_future = Future[Any]()
 
-    while self._busy_future:
-      await self._busy_future
-
-    future = Future[Any]()
-    self._busy_future = future
-
-    # If an exception is raised during _query(), it is impossible to know whether to request has been acknowledged or not, there we keep _busy_future to a meaningful value.
-    await self._query(command)
-    await asyncio.shield(future)
+      try:
+        await self._query(command)
+        await asyncio.shield(self._run_future)
+      finally:
+        self._run_future = None
 
   async def get_unique_id(self):
     """
@@ -215,14 +201,26 @@ class AMFDevice:
     return self
 
   @aexit_handler
-  async def __aexit__(self):
-    await self.close()
+  async def __aexit__(self, failed: bool):
+    if not failed:
+      async with (self._query_lock, self._run_lock):
+        await self.close()
+    else:
+      await self.close()
 
   async def open(self):
-    if self._closing:
+    if self._read_task:
       raise AMFDeviceConnectionError
 
     self._read_task = asyncio.create_task(self._read_loop())
+
+    try:
+      # Set answer mode to asynchronous
+      await self._query("!501")
+    except Exception:
+      # Avoid preventing __aexit__() from being called
+      await self.close()
+      raise
 
   async def close(self):
     """
@@ -232,32 +230,23 @@ class AMFDevice:
       AMFDeviceConnectionLostError: If the device was already closed.
     """
 
-    if self._closing:
+    if self._closing or (not self._read_task):
       raise AMFDeviceConnectionError
 
     self._closing = True
 
     # Cancel the read task, if any
 
-    if self._read_task:
-      self._read_task.cancel()
+    self._read_task.cancel()
 
-      try:
-        await self._read_task
-      except asyncio.CancelledError:
-        pass
-
-    # Wait for all futures to raise, as planned by the read task on exit
-
-    futures = set(self._query_futures) | ({self._busy_future} if self._busy_future else set())
-
-    if futures:
-      await asyncio.wait(futures)
-
-    assert self._serial
+    try:
+      await self._read_task
+    except asyncio.CancelledError:
+      pass
+    finally:
+      del self._read_task
 
     self._serial.close()
-    self._serial = None
 
   @staticmethod
   def list():

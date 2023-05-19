@@ -34,7 +34,7 @@ async def main():
           f"Current valve: {valve if valve is not None else '<uninitialized>'}",
           f"Valve count: {await device.get_valve_count()}"
         ]))
-    except AMFDeviceConnectionError:
+    except* AMFDeviceConnectionError:
       pass
 
   if root.children:
