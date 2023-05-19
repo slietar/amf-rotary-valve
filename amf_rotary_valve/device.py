@@ -1,6 +1,6 @@
 import asyncio
 import builtins
-from asyncio import Future
+from asyncio import Event, Future
 from collections import deque
 from dataclasses import dataclass
 from typing import Any, Optional, overload
@@ -49,21 +49,25 @@ class AMFDevice:
       raise AMFDeviceConnectionError from e
 
     self._busy = False
-    self._closing = False
     self._busy_future: Optional[Future[Any]] = None
+    self._closing = False
+    self._error_event = Event()
     self._query_futures = deque[Future[Any]]()
 
   async def _read_loop(self):
-    loop = asyncio.get_event_loop()
-
     try:
       while True:
         assert self._serial
         serial = self._serial
 
         # Call _receive() to process the received data
-        self._receive((await loop.run_in_executor(None, lambda: serial.read_until(b"\n")))[0:-2])
+        self._receive((await asyncio.to_thread(lambda: serial.read_until(b"\n")))[0:-2])
+    except SerialException as e:
+      raise AMFDeviceConnectionError from e
     finally:
+      if not self._closing:
+        self._error_event.set()
+
       self._read_task = None
 
       # Raise exceptions in all the current futures
@@ -87,19 +91,17 @@ class AMFDevice:
   async def _query(self, command: str, dtype = None) -> str:
     pass
 
-  async def _query(self, command: str, dtype: Optional[type[bool] | type[int]] = None):
+  async def _query(self, command: str, dtype: Optional[Datatype] = None):
     if self._closing:
       raise AMFDeviceConnectionError
 
-    future = Future()
+    future = Future[Any]()
     self._query_futures.append(future)
-
-    loop = asyncio.get_event_loop()
 
     try:
       try:
         assert (serial := self._serial)
-        await loop.run_in_executor(None, lambda: serial.write(f"/_{command}\r".encode("utf-8")))
+        await asyncio.to_thread(lambda: serial.write(f"/_{command}\r".encode()))
       except:
         # Remove the future if the write failed
         self._query_futures.remove(future)
@@ -107,10 +109,11 @@ class AMFDevice:
 
       return self._parse(await asyncio.wait_for(asyncio.shield(future), timeout=2.0), dtype=dtype)
     except (SerialException, asyncio.TimeoutError) as e:
+      self._error_event.set()
       raise AMFDeviceConnectionError from e
 
   def _parse(self, data: bytes, dtype: Optional[Datatype] = None):
-    response = data[3:-1].decode("utf-8")
+    response = data[3:-1].decode()
 
     match dtype:
       case builtins.bool:
@@ -203,6 +206,9 @@ class AMFDevice:
     """
 
     await self._run(f"M{round(delay * 1000)}R")
+
+  async def wait_error(self):
+    await self._error_event.wait()
 
   async def __aenter__(self):
     await self.open()
